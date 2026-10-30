@@ -13,10 +13,14 @@ import selectors
 import subprocess
 import time
 from contextlib import closing
+from importlib.metadata import version
 from pathlib import Path
 
 from sglang_omni_mlx.native.ci.long_audio_client import (
+    HTTP_TRANSCRIPTION_FIELDS,
+    MEMORY_SAMPLE_INTERVAL_SECONDS,
     MemorySampler,
+    compare_cancellation_timing,
     score,
     stream_recording,
     transcribe_http,
@@ -41,8 +45,18 @@ def main() -> None:
         default=1,
         help="Realtime audio seconds per wall second; >1 is accelerated, not live pacing",
     )
-    parser.add_argument("--timeout-seconds", type=float, default=300)
-    parser.add_argument("--max-footprint-gib", type=float, default=8)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=300,
+        help="HTTP request deadline and realtime wait after audio input ends",
+    )
+    parser.add_argument(
+        "--max-footprint-gib",
+        type=float,
+        default=8,
+        help="Sampled soft guard for the server footprint; allocations can overshoot between samples",
+    )
     parser.add_argument("--seed", type=int, default=2888)
     arguments = parser.parse_args()
     if (
@@ -76,6 +90,19 @@ def main() -> None:
             ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
         ).strip(),
         "macos": platform.mac_ver()[0],
+        "measurement_dependencies": {
+            "rapidfuzz": version("rapidfuzz"),
+            "websockets": version("websockets"),
+        },
+        "protocol": {
+            "http_fields": HTTP_TRANSCRIPTION_FIELDS,
+            "realtime_turn_detection": None,
+            "realtime_audio_layout_and_stop_rules": "server defaults",
+        },
+        "memory_guard": {
+            "kind": "sampled_soft",
+            "sample_interval_seconds": MEMORY_SAMPLE_INTERVAL_SECONDS,
+        },
         "git_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
@@ -254,14 +281,24 @@ def main() -> None:
                     result["post_recovery_footprint_bytes"] = sampler.samples[-1][
                         "footprint_bytes"
                     ]
-                    cancellation["faster_than_natural_completion"] = (
-                        cancellation["disconnect_to_idle_seconds"]
-                        < natural["wall_seconds"] * 0.7
+                    (
+                        cancellation["paired_baseline_remaining_seconds"],
+                        cancellation["idle_before_paired_baseline"],
+                    ) = compare_cancellation_timing(
+                        natural["heartbeat_to_completion_seconds"],
+                        cancellation["heartbeat_to_disconnect_seconds"],
+                        cancellation["disconnect_to_idle_seconds"],
                     )
                     if not result["recovery_matches_warmup"]:
                         raise RuntimeError(
                             "Post-cancellation transcript differs from warmup"
                         )
+                    elif cancellation["idle_before_paired_baseline"] is not True:
+                        result["status"] = "inconclusive"
+                        result["error"] = (
+                            "Paired timing does not establish an earlier return to idle"
+                        )
+                        failures += 1
                     else:
                         result["status"] = "measured"
                 except Exception as error:

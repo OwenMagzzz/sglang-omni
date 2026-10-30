@@ -10,14 +10,18 @@ import subprocess
 import sys
 import threading
 import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.server import ServerConnection, serve
 
 from sglang_omni_mlx.native.ci.long_audio_client import (
     MemorySampler,
+    compare_cancellation_timing,
     score,
+    stream_recording,
     transcribe_http,
 )
 from sglang_omni_mlx.native.ci.long_audio_corpus import (
@@ -95,6 +99,95 @@ def test_empty_reference_is_not_a_perfect_score() -> None:
         score("", "hallucinated text", "en")
 
 
+@pytest.mark.parametrize(
+    (
+        "natural_seconds",
+        "disconnect_seconds",
+        "idle_seconds",
+        "remaining_seconds",
+        "earlier",
+    ),
+    [
+        (6.0, 2.0, 3.9, 4.0, True),
+        (6.0, 2.0, 4.1, 4.0, False),
+        (None, 1.0, 1.0, None, None),
+        (1.0, 1.0, 0.1, None, None),
+    ],
+)
+def test_cancellation_timing_uses_the_same_heartbeat_origin(
+    natural_seconds: float | None,
+    disconnect_seconds: float,
+    idle_seconds: float,
+    remaining_seconds: float | None,
+    earlier: bool | None,
+) -> None:
+    """Time spent before disconnect is not counted as remaining baseline time."""
+    assert compare_cancellation_timing(
+        natural_seconds, disconnect_seconds, idle_seconds
+    ) == (remaining_seconds, earlier)
+
+
+@pytest.mark.parametrize("send_final", [True, False])
+def test_realtime_silent_audio_does_not_time_out_before_input_ends(
+    tmp_path: Path, send_final: bool
+) -> None:
+    """A session with no preview events must remain open while audio is sent."""
+    recording = tmp_path / "silence.wav"
+    with wave.open(str(recording), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(b"\x00\x00" * 48000)
+    received_frames = []
+
+    def handle(socket: ServerConnection) -> None:
+        socket.recv()
+        socket.send(json.dumps({"type": "transcription_session.updated"}))
+        try:
+            for raw in socket:
+                event = json.loads(raw)
+                if event["type"] == "input_audio_buffer.append":
+                    received_frames.append(event["audio"])
+                elif event["type"] == "transcription.done" and send_final:
+                    socket.send(
+                        json.dumps({"type": "transcription.completed", "text": ""})
+                    )
+                    return
+                else:
+                    pass
+        except ConnectionClosed:
+            pass
+
+    with serve(handle, "127.0.0.1", 0) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            if send_final:
+                result = stream_recording(
+                    server.socket.getsockname()[1],
+                    recording,
+                    "en",
+                    1,
+                    1,
+                    tmp_path / "events.jsonl",
+                )
+                assert result["text"] == ""
+            else:
+                with pytest.raises(TimeoutError, match="No completed transcript"):
+                    stream_recording(
+                        server.socket.getsockname()[1],
+                        recording,
+                        "en",
+                        1,
+                        1,
+                        tmp_path / "events.jsonl",
+                    )
+            assert len(received_frames) == 30
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
 @pytest.mark.skipif(platform.system() != "Darwin", reason="macOS process accounting")
 @pytest.mark.parametrize("limit_bytes,limit_seconds", [(1, 60), (2**40, 0)])
 def test_resource_guard_stops_its_child(
@@ -129,6 +222,33 @@ def test_resource_guard_stops_its_child(
             pass
 
 
+@pytest.mark.skipif(platform.system() != "Darwin", reason="macOS process accounting")
+def test_resource_guard_stops_child_when_trace_cannot_be_written(
+    tmp_path: Path,
+) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "input()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    sampler = MemorySampler(process, tmp_path / "missing" / "memory.jsonl", 2**40, 60)
+    try:
+        sampler.thread.start()
+        assert process.wait(timeout=5) != 0
+        sampler.thread.join(timeout=5)
+        assert not sampler.thread.is_alive()
+        assert "Memory trace failed" in sampler.error
+    finally:
+        sampler.done.set()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        else:
+            pass
+
+
 @pytest.mark.parametrize("seconds", [0, -1, float("nan"), float("inf")])
 def test_invalid_duration_cannot_create_an_unbounded_recording(
     tmp_path: Path, seconds: float
@@ -152,14 +272,17 @@ def test_invalid_duration_cannot_create_an_unbounded_recording(
     "reply",
     [
         b'data: {"type":"transcript.text.done","text":"actual transcript"}\n\n',
+        b':\n\ndata: {"type":"transcript.text.done","text":"actual transcript"}\n\n',
         b'data: {"type":"error","error":"failed"}\n\n',
         b":\n\n",
     ],
 )
 def test_http_requires_a_successful_final_event(reply: bytes) -> None:
+    submitted = []
+
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
-            self.rfile.read(int(self.headers["Content-Length"]))
+            submitted.append(self.rfile.read(int(self.headers["Content-Length"])))
             self.send_response(200)
             self.end_headers()
             self.wfile.write(reply)
@@ -169,12 +292,45 @@ def test_http_requires_a_successful_final_event(reply: bytes) -> None:
         thread.start()
         try:
             if b"transcript.text.done" in reply:
+                result = transcribe_http(server.server_port, b"audio", "en", 2)
+                assert result["text"] == "actual transcript"
                 assert (
-                    transcribe_http(server.server_port, b"audio", "en", 2)["text"]
-                    == "actual transcript"
-                )
+                    result["heartbeat_to_completion_seconds"] is not None
+                ) == reply.startswith(b":")
             else:
                 with pytest.raises(RuntimeError):
                     transcribe_http(server.server_port, b"audio", "en", 2)
+            assert b'name="audio_layout"\r\n\r\nvoxt_swift' in submitted[0]
+            assert b'name="stop_on_token_loop"\r\n\r\ntrue' in submitted[0]
         finally:
+            thread.join(timeout=5)
+
+
+def test_http_disconnect_records_the_first_heartbeat_and_running_state() -> None:
+    release = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b":\n\n")
+            self.wfile.flush()
+            release.wait(timeout=5)
+
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"request_states":{"running":1}}')
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            result = transcribe_http(server.server_port, b"audio", "en", 2, cancel=True)
+            assert result["observed_running"] is True
+            assert result["heartbeat_to_disconnect_seconds"] >= 0
+        finally:
+            release.set()
+            server.shutdown()
             thread.join(timeout=5)

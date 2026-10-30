@@ -22,6 +22,15 @@ from websockets.sync.client import connect
 
 from sglang_omni_mlx.native.ci.long_audio_corpus import SAMPLE_BYTES, SAMPLE_RATE
 
+HTTP_TRANSCRIPTION_FIELDS = {
+    "stream": "true",
+    "include_generation_metadata": "true",
+    "stop_on_token_loop": "true",
+    "stop_at_end_of_text": "true",
+    "audio_layout": "voxt_swift",
+}
+MEMORY_SAMPLE_INTERVAL_SECONDS = 0.25
+
 
 class GenerationMetadata(TypedDict):
     generated_token_count: int
@@ -38,7 +47,10 @@ class Measurement(TypedDict, total=False):
     disconnect_monotonic: float
     disconnect_to_idle_seconds: float
     natural_completion_seconds: float
-    faster_than_natural_completion: bool
+    heartbeat_to_completion_seconds: float | None
+    heartbeat_to_disconnect_seconds: float
+    paired_baseline_remaining_seconds: float | None
+    idle_before_paired_baseline: bool | None
     finalization_seconds: float
     final_segments: int
     preview_events: int
@@ -89,39 +101,53 @@ class MemorySampler:
         self.library.proc_pid_rusage.restype = ctypes.c_int
         self.thread = threading.Thread(target=self.sample, daemon=True)
 
+    def stop_on_error(self, message: str) -> None:
+        self.error = message
+        if self.process.poll() is None:
+            try:
+                self.process.kill()
+            except ProcessLookupError:
+                pass
+        else:
+            pass
+
     def sample(self) -> None:
         started = time.monotonic()
-        with self.destination.open("w") as output:
-            while not self.done.is_set() and self.process.poll() is None:
-                usage = ProcessUsage()
-                if (
-                    self.library.proc_pid_rusage(
-                        self.process.pid, 0, ctypes.byref(usage)
-                    )
-                    != 0
-                ):
-                    self.error = f"proc_pid_rusage failed: errno {ctypes.get_errno()}"
-                    return
-                else:
-                    row = {
-                        "phase": self.phase,
-                        "elapsed_seconds": time.monotonic() - started,
-                        "footprint_bytes": usage.footprint_bytes,
-                        "resident_bytes": usage.resident_bytes,
-                    }
-                    self.samples.append(row)
-                    output.write(json.dumps(row) + "\n")
-                    output.flush()
-                if time.monotonic() - started > self.limit_seconds:
-                    self.error = "Case wall-clock deadline exceeded"
-                    self.process.kill()
-                    return
-                elif usage.footprint_bytes > self.limit_bytes:
-                    self.exceeded = True
-                    self.process.kill()
-                    return
-                else:
-                    self.done.wait(0.25)
+        try:
+            with self.destination.open("w") as output:
+                while not self.done.is_set() and self.process.poll() is None:
+                    usage = ProcessUsage()
+                    if (
+                        self.library.proc_pid_rusage(
+                            self.process.pid, 0, ctypes.byref(usage)
+                        )
+                        != 0
+                    ):
+                        self.stop_on_error(
+                            f"proc_pid_rusage failed: errno {ctypes.get_errno()}"
+                        )
+                        return
+                    else:
+                        row = {
+                            "phase": self.phase,
+                            "elapsed_seconds": time.monotonic() - started,
+                            "footprint_bytes": usage.footprint_bytes,
+                            "resident_bytes": usage.resident_bytes,
+                        }
+                        self.samples.append(row)
+                        output.write(json.dumps(row) + "\n")
+                        output.flush()
+                    if time.monotonic() - started > self.limit_seconds:
+                        self.stop_on_error("Case wall-clock deadline exceeded")
+                        return
+                    elif usage.footprint_bytes > self.limit_bytes:
+                        self.exceeded = True
+                        self.process.kill()
+                        return
+                    else:
+                        self.done.wait(MEMORY_SAMPLE_INTERVAL_SECONDS)
+        except OSError as error:
+            self.stop_on_error(f"Memory trace failed: {error}")
 
 
 def score(
@@ -149,18 +175,29 @@ def score(
         }
 
 
+def compare_cancellation_timing(
+    heartbeat_to_completion_seconds: float | None,
+    heartbeat_to_disconnect_seconds: float,
+    disconnect_to_idle_seconds: float,
+) -> tuple[float | None, bool | None]:
+    """Compare paired runs from their first heartbeat without declaring causality."""
+    if (
+        heartbeat_to_completion_seconds is None
+        or heartbeat_to_completion_seconds <= heartbeat_to_disconnect_seconds
+    ):
+        return None, None
+    else:
+        remaining_seconds = (
+            heartbeat_to_completion_seconds - heartbeat_to_disconnect_seconds
+        )
+        return remaining_seconds, disconnect_to_idle_seconds < remaining_seconds
+
+
 def transcribe_http(
     port: int, wav: bytes, language: str, timeout_seconds: float, cancel: bool = False
 ) -> Measurement:
     boundary = "omni-long-audio-benchmark"
-    fields = {
-        "language": language,
-        "stream": "true",
-        "include_generation_metadata": "true",
-        "stop_on_token_loop": "true",
-        "stop_at_end_of_text": "true",
-        "audio_layout": "voxt_swift",
-    }
+    fields = {"language": language, **HTTP_TRANSCRIPTION_FIELDS}
     body = b"".join(
         f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
         for name, value in fields.items()
@@ -172,6 +209,7 @@ def transcribe_http(
     )
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_seconds)
     started = time.monotonic()
+    first_heartbeat_at: float | None = None
     try:
         connection.request(
             "POST",
@@ -188,24 +226,40 @@ def transcribe_http(
             while line := response.readline():
                 if time.monotonic() - started > timeout_seconds:
                     raise TimeoutError("HTTP transcription deadline exceeded")
-                elif cancel and line.startswith(b":"):
-                    with closing(
-                        http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                    ) as health:
-                        health.request("GET", "/health")
-                        states = json.loads(health.getresponse().read())[
-                            "request_states"
-                        ]
-                    return {
-                        "observed_running": states.get("running", 0) == 1,
-                        "disconnect_monotonic": time.monotonic(),
-                    }
+                elif line.startswith(b":"):
+                    if first_heartbeat_at is None:
+                        first_heartbeat_at = time.monotonic()
+                    else:
+                        pass
+                    if cancel:
+                        with closing(
+                            http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                        ) as health:
+                            health.request("GET", "/health")
+                            states = json.loads(health.getresponse().read())[
+                                "request_states"
+                            ]
+                        disconnect_at = time.monotonic()
+                        return {
+                            "observed_running": states.get("running", 0) == 1,
+                            "disconnect_monotonic": disconnect_at,
+                            "heartbeat_to_disconnect_seconds": disconnect_at
+                            - first_heartbeat_at,
+                        }
+                    else:
+                        pass
                 elif line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                     event = json.loads(line[6:])
                     if event.get("type") == "transcript.text.done":
+                        finished = time.monotonic()
                         return {
                             **event,
-                            "wall_seconds": time.monotonic() - started,
+                            "wall_seconds": finished - started,
+                            "heartbeat_to_completion_seconds": (
+                                finished - first_heartbeat_at
+                                if first_heartbeat_at is not None
+                                else None
+                            ),
                             "observed_running": False,
                         }
                     else:
@@ -256,7 +310,7 @@ def stream_recording(
             try:
                 with events_path.open("w") as output:
                     while True:
-                        event = json.loads(socket.recv(timeout=timeout_seconds))
+                        event = json.loads(socket.recv())
                         output.write(
                             json.dumps(
                                 {
